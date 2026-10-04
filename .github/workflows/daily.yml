@@ -2,7 +2,7 @@ name: tw-stock-daily
 
 on:
   schedule:
-    - cron: "40 7 * * 1-5"
+    - cron: "30 8 * * 1-5"
   workflow_dispatch:
     inputs:
       force:
@@ -26,4 +26,5 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FORCE_SEND: ${{ inputs.force }}
