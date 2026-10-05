@@ -22,9 +22,17 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - run: sudo apt-get update -y && sudo apt-get install -y fonts-wqy-microhei
+
       - run: python main.py
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FORCE_SEND: ${{ inputs.force }}
+
+      - run: python chips.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           FORCE_SEND: ${{ inputs.force }}
