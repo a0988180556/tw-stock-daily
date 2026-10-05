@@ -12,6 +12,9 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+plt.rcParams["font.sans-serif"] = ["WenQuanYi Micro Hei", "Noto Sans CJK TC", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+
 TZ = ZoneInfo("Asia/Taipei")
 TOKEN = os.environ.get("TG_TOKEN")
 CHAT_ID = os.environ.get("TG_CHAT_ID")
@@ -74,7 +77,6 @@ def add_indicators(df):
     for n in (5, 20, 60):
         df[f"MA{n}"] = df["Close"].rolling(n).mean()
 
-    # RSI(14),Wilder 平滑
     delta = df["Close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -83,7 +85,6 @@ def add_indicators(df):
     rs = avg_gain / avg_loss
     df["RSI"] = 100 - 100 / (1 + rs)
 
-    # KD(9,3,3),起始值 50
     low9 = df["Low"].rolling(9).min()
     high9 = df["High"].rolling(9).max()
     rsv = (df["Close"] - low9) / (high9 - low9) * 100
@@ -110,7 +111,7 @@ def get_institutional(ymd):
     if j.get("stat") != "OK":
         raise RuntimeError(f"stat={j.get('stat')}")
     rows = j["data"]
-    scale = 1e8 if num(rows[0][1]) > 1e7 else 1.0  # 元 → 億元
+    scale = 1e8 if num(rows[0][1]) > 1e7 else 1.0
     out = {"外資": 0.0, "投信": 0.0, "自營商": 0.0, "合計": 0.0}
     for r in rows:
         name = re.sub(r"\s", "", strip_html(r[0]))
@@ -165,18 +166,18 @@ def make_chart(df):
         gridspec_kw={"height_ratios": [3, 1, 1]},
     )
     ax = axes[0]
-    ax.plot(d.index, d["Close"], label="TAIEX", color="black", linewidth=1.6)
-    ax.plot(d.index, d["MA5"], label="MA5", linewidth=1)
-    ax.plot(d.index, d["MA20"], label="MA20", linewidth=1)
-    ax.plot(d.index, d["MA60"], label="MA60", linewidth=1)
-    ax.set_title(f"TAIEX  {d.index[-1].date()}")
-    ax.legend(loc="upper left", ncol=4, fontsize=8)
+    ax.plot(d.index, d["Close"], label="加權指數", color="black", linewidth=1.6)
+    ax.plot(d.index, d["MA5"], label="近1週平均", linewidth=1)
+    ax.plot(d.index, d["MA20"], label="近1個月平均", linewidth=1)
+    ax.plot(d.index, d["MA60"], label="近1季平均", linewidth=1)
+    ax.set_title(f"加權指數走勢  {d.index[-1].date()}")
+    ax.legend(loc="upper left", ncol=4, fontsize=9)
     ax.grid(alpha=0.3)
 
     axes[1].plot(d.index, d["RSI"], color="purple")
     axes[1].axhline(70, color="red", linestyle="--", linewidth=0.8)
     axes[1].axhline(30, color="green", linestyle="--", linewidth=0.8)
-    axes[1].set_ylabel("RSI(14)")
+    axes[1].set_ylabel("買氣熱度(RSI)")
     axes[1].set_ylim(0, 100)
     axes[1].grid(alpha=0.3)
 
@@ -184,9 +185,9 @@ def make_chart(df):
     axes[2].plot(d.index, d["D"], label="D")
     axes[2].axhline(80, color="red", linestyle="--", linewidth=0.8)
     axes[2].axhline(20, color="green", linestyle="--", linewidth=0.8)
-    axes[2].set_ylabel("KD(9,3,3)")
+    axes[2].set_ylabel("短線動能(KD)")
     axes[2].set_ylim(0, 100)
-    axes[2].legend(loc="upper left", fontsize=8)
+    axes[2].legend(loc="upper left", fontsize=9)
     axes[2].grid(alpha=0.3)
 
     fig.autofmt_xdate()
@@ -197,25 +198,66 @@ def make_chart(df):
     return buf
 
 
-# ---------- 5. 文字總結 ----------
+# ---------- 5. 口語化技術面 + 總結 ----------
+def trend_text(f):
+    c = f["close"]
+    pos = [c > f["ma5"], c > f["ma20"], c > f["ma60"]]
+    if all(pos) and f["ma5"] > f["ma20"] > f["ma60"]:
+        return "指數站在近一週、近一個月、近一季的平均價之上,而且短期平均高於長期平均,整體走勢偏強。"
+    if all(pos):
+        return "指數站在近一週、近一個月、近一季的平均價之上,走勢偏強。"
+    if not any(pos):
+        return "指數落在近一週、近一個月、近一季的平均價之下,走勢偏弱。"
+    parts = [
+        f"{'站上' if pos[0] else '跌破'}近一週平均價",
+        f"{'站上' if pos[1] else '跌破'}近一個月平均價",
+        f"{'站上' if pos[2] else '跌破'}近一季平均價",
+    ]
+    return "多空訊號不一:" + "、".join(parts) + ",目前偏向整理。"
+
+
+def rsi_text(f):
+    r = f["rsi"]
+    if r >= 70:
+        return f"短線買氣偏熱(買氣指標 RSI {r:.0f}),漲多之後要留意拉回整理。"
+    if r <= 30:
+        return f"短線賣壓偏重(買氣指標 RSI {r:.0f}),已有超跌跡象,留意是否止穩。"
+    return f"短線買氣中性(買氣指標 RSI {r:.0f})。"
+
+
+def kd_text(f):
+    k, d = f["k"], f["d"]
+    if k >= 80:
+        return f"短線動能指標(KD)在高檔(K {k:.0f}、D {d:.0f}),動能強但高檔容易震盪。"
+    if k <= 20:
+        return f"短線動能指標(KD)在低檔(K {k:.0f}、D {d:.0f}),短線偏弱,留意是否止跌。"
+    if k > d:
+        return f"短線動能指標(KD)偏多(K {k:.0f} 高於 D {d:.0f})。"
+    return f"短線動能指標(KD)偏空(K {k:.0f} 低於 D {d:.0f})。"
+
+
+def tech_lines(f):
+    return [
+        trend_text(f),
+        f"參考:近一週平均約 {f['ma5']:,.0f} 點、近一個月約 {f['ma20']:,.0f} 點、近一季約 {f['ma60']:,.0f} 點。",
+        rsi_text(f),
+        kd_text(f),
+    ]
+
+
 def template_summary(f):
     p = []
     direction = "上漲" if f["chg"] > 0 else ("下跌" if f["chg"] < 0 else "持平")
     p.append(f"加權指數收{f['close']:,.0f}點,{direction}{abs(f['chg']):,.0f}點({f['pct']:+.2f}%)。")
-    p.append(f"收盤{'站上' if f['close'] > f['ma20'] else '跌破'}月線,{'高於' if f['close'] > f['ma5'] else '低於'}5日均線。")
-    if f["rsi"] >= 70:
-        p.append(f"RSI {f['rsi']:.0f}進入偏熱區。")
-    elif f["rsi"] <= 30:
-        p.append(f"RSI {f['rsi']:.0f}進入偏弱區。")
-    else:
-        p.append(f"RSI {f['rsi']:.0f},位於中性區間。")
-    p.append(f"KD方面K值{f['k']:.0f}、D值{f['d']:.0f},K{'高於' if f['k'] > f['d'] else '低於'}D。")
+    p.append(trend_text(f))
+    p.append(rsi_text(f))
+    p.append(kd_text(f))
     if f.get("inst"):
         fr = f["inst"]["外資"]
         p.append(f"外資{'買超' if fr > 0 else '賣超'}{abs(fr):,.0f}億元。")
     if f.get("sectors"):
         p.append(f"類股以{f['sectors'][0][0]}表現最強,{f['sectors'][-1][0]}最弱。")
-    p.append(f"隔日觀察5日線{f['ma5']:,.0f}與月線{f['ma20']:,.0f}附近的攻防。")
+    p.append(f"隔日留意指數能否守住近一週平均價約 {f['ma5']:,.0f} 點,以及近一個月平均價約 {f['ma20']:,.0f} 點。")
     return "".join(p)
 
 
@@ -227,6 +269,8 @@ def llm_summary(facts):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     prompt = (
         "你是台股盤後分析助理。請只根據下列數據,用繁體中文寫約180字的大盤總結,"
+        "語氣口語、讓一般投資人看得懂;不要出現 5MA、20MA、60MA、均線這類縮寫或術語,"
+        "技術面請用「近一週、近一個月、近一季的平均價」來描述。"
         "最後一句寫隔日觀察重點。不可編造數據中沒有的資訊,不要給買賣建議。\n\n" + facts
     )
     r = requests.post(
@@ -283,8 +327,7 @@ def build_report(df, inst, sectors):
     lines.append("")
 
     lines.append("【技術面】")
-    lines.append(f"5MA {f['ma5']:,.0f}|20MA {f['ma20']:,.0f}|60MA {f['ma60']:,.0f}")
-    lines.append(f"RSI(14) {f['rsi']:.1f}|K {f['k']:.1f} D {f['d']:.1f}")
+    lines.extend(tech_lines(f))
     lines.append("")
 
     facts = "\n".join(lines)
