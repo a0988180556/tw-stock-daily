@@ -1,10 +1,18 @@
 import os
+import io
 import re
 import sys
 import time
 import requests
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+plt.rcParams["font.sans-serif"] = ["WenQuanYi Micro Hei", "Noto Sans CJK TC", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
 
 TZ = ZoneInfo("Asia/Taipei")
 TOKEN = os.environ.get("TG_TOKEN")
@@ -13,11 +21,24 @@ FORCE = os.environ.get("FORCE_SEND") == "true"
 UA = {"User-Agent": "Mozilla/5.0"}
 TOP_N = 10
 HISTORY_DAYS = 4  # 另外往前抓 4 個交易日,合計 5 日算連買連賣
+RED, GREEN = "#d62728", "#2e8b57"  # 台股慣例:紅=買超/上漲,綠=賣超/下跌
 
 
 def tg_text(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
+    r.raise_for_status()
+
+
+def tg_photo(buf):
+    buf.seek(0)
+    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+    r = requests.post(
+        url,
+        data={"chat_id": CHAT_ID},
+        files={"photo": ("chips.png", buf, "image/png")},
+        timeout=60,
+    )
     r.raise_for_status()
 
 
@@ -142,23 +163,70 @@ def streak(code, key, sign, series):
     return n
 
 
-def fmt_list(title, cur, key, sign, series, prices):
+def build_rows(cur, key, sign, series, prices):
     rows = sorted(cur.items(), key=lambda kv: kv[1][key], reverse=sign > 0)[:TOP_N]
-    lines = [title]
+    out = []
     for n, (code, v) in enumerate(rows, 1):
-        tag = ""
         s = streak(code, key, sign, series)
+        streak_txt = "-"
         if s >= 2:
             plus = "+" if s == len(series) else ""
-            tag += f" 連{'買' if sign > 0 else '賣'}{s}{plus}天"
+            streak_txt = f"連{'買' if sign > 0 else '賣'}{s}{plus}天"
         pct = prices.get(code)
+        pct_txt = "-"
         if pct is not None:
-            tag += f" {pct:+.1f}%"
+            pct_txt = f"{pct:+.1f}%"
             if pct >= 9.5:
-                tag += "🔺漲停"
+                pct_txt += " 漲停"
             elif pct <= -9.5:
-                tag += "🔻跌停"
-        lines.append(f"{n}. {v['name']} {code}  {v[key]:+,.0f}{tag}")
+                pct_txt += " 跌停"
+        out.append([str(n), f"{v['name']} {code}", f"{v[key]:+,.0f}", streak_txt, pct_txt])
+    return out
+
+
+def table_image(title, panels):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.6))
+    fig.suptitle(title, fontsize=15, fontweight="bold")
+    for ax, (ptitle, rows, color) in zip(axes, panels):
+        ax.axis("off")
+        ax.set_title(ptitle, fontsize=13, color=color, fontweight="bold")
+        tbl = ax.table(
+            cellText=rows,
+            colLabels=["#", "股票", "張數", "連續", "漲跌幅"],
+            loc="upper center",
+            cellLoc="center",
+            colWidths=[0.07, 0.31, 0.17, 0.20, 0.25],
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(10.5)
+        tbl.scale(1, 1.65)
+        for (r, c), cell in tbl.get_celld().items():
+            if r == 0:
+                cell.set_facecolor(color)
+                cell.get_text().set_color("white")
+                cell.get_text().set_fontweight("bold")
+                continue
+            txt = cell.get_text().get_text()
+            if c == 2:
+                cell.get_text().set_color(color)
+                cell.get_text().set_fontweight("bold")
+            elif c == 4 and len(txt) > 1:
+                cell.get_text().set_color(RED if txt.startswith("+") else GREEN)
+            if r % 2 == 0:
+                cell.set_facecolor("#f5f5f5")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110)
+    plt.close(fig)
+    return buf
+
+
+def fmt_list(title, rows):
+    lines = [title]
+    for r in rows:
+        extra = "" if r[3] == "-" else f" {r[3]}"
+        extra += "" if r[4] == "-" else f" {r[4]}"
+        lines.append(f"{r[0]}. {r[1]}  {r[2]}{extra}")
     return "\n".join(lines)
 
 
@@ -171,16 +239,30 @@ def main():
     series = [cur] + get_history(day, HISTORY_DAYS)
     prices = (safe(get_prices, "股價") or {}) if day == today else {}
 
-    parts = [f"📈 個股籌碼 {day}(單位:張)", ""]
-    parts.append(fmt_list("【投信買超 Top10】", cur, "it", +1, series, prices))
-    parts.append("")
-    parts.append(fmt_list("【外資買超 Top10】", cur, "fi", +1, series, prices))
-    parts.append("")
-    parts.append(fmt_list("【外資賣超 Top10】", cur, "fi", -1, series, prices))
-    parts.append("")
-    parts.append("※ 外資指外陸資(不含外資自營商);連買/連賣以近 5 個交易日計。")
-    parts.append("※ 籌碼資料僅供參考,非投資建議。")
-    tg_text("\n".join(parts))
+    sets = [
+        (f"投信買賣超 {day}(單位:張)", [
+            ("投信買超 Top10", build_rows(cur, "it", +1, series, prices), RED),
+            ("投信賣超 Top10", build_rows(cur, "it", -1, series, prices), GREEN),
+        ]),
+        (f"外資買賣超 {day}(單位:張)", [
+            ("外資買超 Top10", build_rows(cur, "fi", +1, series, prices), RED),
+            ("外資賣超 Top10", build_rows(cur, "fi", -1, series, prices), GREEN),
+        ]),
+    ]
+
+    images = [safe(lambda: table_image(t, p), "表格圖") for t, p in sets]
+    if all(images):
+        for img in images:
+            tg_photo(img)
+    else:  # 圖片失敗時退回文字版
+        parts = [f"📈 個股籌碼 {day}(單位:張)", ""]
+        for _, panels in sets:
+            for ptitle, rows, _c in panels:
+                parts.append(fmt_list(f"【{ptitle}】", rows))
+                parts.append("")
+        tg_text("\n".join(parts))
+
+    tg_text("※ 外資指外陸資(不含外資自營商);連買/連賣以近 5 個交易日計。\n※ 籌碼資料僅供參考,非投資建議。")
     print("已發送")
 
 
