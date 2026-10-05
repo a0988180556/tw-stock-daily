@@ -158,6 +158,151 @@ def get_sectors(ymd):
     return rows
 
 
+# ---------- 3b. 上漲、下跌家數(上市 + 上櫃) ----------
+def get_breadth(ymd):
+    """上市:取證交所每日收盤行情中的「漲跌證券數」(股票欄)。"""
+    j = None
+    for base in (
+        "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
+        "https://www.twse.com.tw/exchangeReport/MI_INDEX",
+    ):
+        try:
+            j = get_json(base, {"response": "json", "date": ymd, "type": "ALLBUT0999"})
+            break
+        except Exception as e:
+            print(f"[MI_INDEX {ymd}] {base} 失敗: {e}")
+    if not j or j.get("stat") != "OK":
+        raise RuntimeError(f"MI_INDEX stat={j.get('stat') if j else None}")
+
+    candidates = [(t.get("fields", []), t.get("data", [])) for t in j.get("tables", [])]
+    for k, v in j.items():  # 舊版格式:dataN / fieldsN
+        if k.startswith("data") and k[4:].isdigit():
+            candidates.append((j.get("fields" + k[4:], []), v))
+
+    for fields, rows in candidates:
+        if not rows or not isinstance(rows[0], list):
+            continue
+        if not any(strip_html(r[0]).startswith("上漲") for r in rows):
+            continue
+        col = next((i for i, f in enumerate(fields) if "股票" in f), len(fields) - 1)
+        res = {}
+        for r in rows:
+            name = strip_html(r[0])
+            cell = strip_html(r[col]).replace(" ", "")
+            m = re.match(r"([\d,]+)(?:\((\d+)\))?", cell)
+            if not m:
+                continue
+            n = int(m.group(1).replace(",", ""))
+            lim = int(m.group(2)) if m.group(2) else 0
+            if name.startswith("上漲"):
+                res["up"], res["up_limit"] = n, lim
+            elif name.startswith("下跌"):
+                res["down"], res["down_limit"] = n, lim
+            elif name.startswith("持平"):
+                res["flat"] = n
+        if "up" in res and "down" in res:
+            res.setdefault("flat", 0)
+            res.setdefault("up_limit", 0)
+            res.setdefault("down_limit", 0)
+            return res
+    raise RuntimeError("找不到漲跌證券數表")
+
+
+def get_tpex_breadth(day):
+    """上櫃:由櫃買中心個股收盤行情逐檔計算(只計 4 位數代號的一般股票)。"""
+    attempts = [
+        (
+            "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc",
+            {"date": day.strftime("%Y/%m/%d"), "type": "EW", "response": "json"},
+        ),
+        (  # 舊版網址,當備援
+            "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php",
+            {"l": "zh-tw", "d": f"{day.year - 1911}/{day.month:02d}/{day.day:02d}", "se": "EW"},
+        ),
+    ]
+    rows, cols = None, None
+    for url, params in attempts:
+        try:
+            j = get_json(url, params)
+        except Exception as e:
+            print(f"[櫃買 {url}] 失敗: {e}")
+            continue
+        if j.get("tables"):
+            t = j["tables"][0]
+            fields = [str(f).strip() for f in t.get("fields", [])]
+            if "代號" in fields and t.get("data"):
+                rows = t["data"]
+                cols = (
+                    fields.index("代號"),
+                    next(i for i, f in enumerate(fields) if f.startswith("收盤")),
+                    next(i for i, f in enumerate(fields) if f.startswith("漲跌")),
+                )
+                break
+        elif j.get("aaData"):
+            rows, cols = j["aaData"], (0, 2, 3)
+            break
+    if not rows:
+        raise RuntimeError("櫃買中心沒有資料(休市或尚未公布)")
+
+    i_code, i_close, i_chg = cols
+    res = {"up": 0, "down": 0, "flat": 0, "up_limit": 0, "down_limit": 0}
+    for r in rows:
+        code = str(r[i_code]).strip()
+        if not (len(code) == 4 and code.isdigit()):
+            continue
+        try:
+            close = num(r[i_close])
+            chg = num(str(r[i_chg]).replace("+", ""))
+        except ValueError:
+            continue
+        pct = chg / (close - chg) * 100 if close - chg > 0 else 0
+        if chg > 0:
+            res["up"] += 1
+            if pct >= 9.5:
+                res["up_limit"] += 1
+        elif chg < 0:
+            res["down"] += 1
+            if pct <= -9.5:
+                res["down_limit"] += 1
+        else:
+            res["flat"] += 1
+    if res["up"] + res["down"] + res["flat"] < 300:
+        raise RuntimeError("上櫃檔數異常偏少,可能欄位解析有誤")
+    return res
+
+
+def get_breadth_all(ymd):
+    day = datetime.strptime(ymd, "%Y%m%d").date()
+    twse = get_breadth(ymd)
+    otc = safe(lambda: get_tpex_breadth(day), "上櫃家數")
+    keys = ("up", "down", "flat", "up_limit", "down_limit")
+    total = {k: twse[k] + (otc[k] if otc else 0) for k in keys}
+    total["twse"], total["otc"] = twse, otc
+    return total
+
+
+def fmt_breadth_line(label, b):
+    return (
+        f"{label} 上漲 {b['up']}(漲停 {b['up_limit']})|"
+        f"下跌 {b['down']}(跌停 {b['down_limit']})|持平 {b['flat']}"
+    )
+
+
+def breadth_text(b, index_chg):
+    up, dn = b["up"], b["down"]
+    if up > dn * 1.5:
+        s = "上漲家數明顯多於下跌家數,盤面普遍偏多。"
+    elif dn > up * 1.5:
+        s = "下跌家數明顯多於上漲家數,盤面普遍偏空。"
+    else:
+        s = "漲跌家數相近,個股漲跌互見。"
+    if index_chg > 0 and dn > up:
+        s += "指數上漲但多數個股下跌,漲勢集中在少數權值股。"
+    elif index_chg < 0 and up > dn:
+        s += "指數下跌但多數個股上漲,跌勢集中在少數權值股。"
+    return s
+
+
 # ---------- 4. 圖表 ----------
 def make_chart(df):
     d = df.tail(60)
@@ -249,6 +394,10 @@ def template_summary(f):
     p = []
     direction = "上漲" if f["chg"] > 0 else ("下跌" if f["chg"] < 0 else "持平")
     p.append(f"加權指數收{f['close']:,.0f}點,{direction}{abs(f['chg']):,.0f}點({f['pct']:+.2f}%)。")
+    if f.get("breadth"):
+        b = f["breadth"]
+        scope = "上市櫃" if b["otc"] else "上市"
+        p.append(f"{scope}股票上漲{b['up']}家、下跌{b['down']}家。" + breadth_text(b, f["chg"]))
     p.append(trend_text(f))
     p.append(rsi_text(f))
     p.append(kd_text(f))
@@ -271,6 +420,7 @@ def llm_summary(facts):
         "你是台股盤後分析助理。請只根據下列數據,用繁體中文寫約180字的大盤總結,"
         "語氣口語、讓一般投資人看得懂;不要出現 5MA、20MA、60MA、均線這類縮寫或術語,"
         "技術面請用「近一週、近一個月、近一季的平均價」來描述。"
+        "如果有上漲、下跌家數,請一併說明盤面是普遍上漲還是少數權值股帶動。"
         "最後一句寫隔日觀察重點。不可編造數據中沒有的資訊,不要給買賣建議。\n\n" + facts
     )
     r = requests.post(
@@ -284,7 +434,7 @@ def llm_summary(facts):
 
 
 # ---------- 組報告 ----------
-def build_report(df, inst, sectors):
+def build_report(df, inst, sectors, breadth):
     last, prev = df.iloc[-1], df.iloc[-2]
     f = {
         "close": float(last["Close"]),
@@ -297,6 +447,7 @@ def build_report(df, inst, sectors):
         "d": float(last["D"]),
         "inst": inst,
         "sectors": sectors,
+        "breadth": breadth,
     }
     f["pct"] = f["chg"] / float(prev["Close"]) * 100
     date_str = df.index[-1].date()
@@ -305,6 +456,19 @@ def build_report(df, inst, sectors):
     lines.append("【大盤】")
     lines.append(f"加權指數 {f['close']:,.2f}")
     lines.append(f"漲跌 {f['chg']:+,.2f}({f['pct']:+.2f}%)")
+    lines.append("")
+
+    lines.append("【漲跌家數】")
+    if breadth:
+        lines.append(fmt_breadth_line("上市", breadth["twse"]))
+        if breadth["otc"]:
+            lines.append(fmt_breadth_line("上櫃", breadth["otc"]))
+            lines.append(fmt_breadth_line("合計", breadth))
+        else:
+            lines.append("上櫃:資料取得失敗(以下判讀僅依上市)")
+        lines.append(breadth_text(breadth, f["chg"]))
+    else:
+        lines.append("(資料取得失敗)")
     lines.append("")
 
     lines.append("【三大法人買賣超(億元)】")
@@ -348,7 +512,8 @@ def main():
     ymd = df.index[-1].strftime("%Y%m%d")
     inst = safe(lambda: get_institutional(ymd), "三大法人")
     sectors = safe(lambda: get_sectors(ymd), "類股")
-    tg_text(build_report(df, inst, sectors))
+    breadth = safe(lambda: get_breadth_all(ymd), "漲跌家數")
+    tg_text(build_report(df, inst, sectors, breadth))
     chart = safe(lambda: make_chart(df), "圖表")
     if chart:
         tg_photo(chart)
