@@ -2,6 +2,7 @@ import os
 import io
 import re
 import sys
+import json
 import time
 import requests
 import matplotlib
@@ -19,8 +20,8 @@ TOKEN = os.environ.get("TG_TOKEN")
 CHAT_ID = os.environ.get("TG_CHAT_ID")
 FORCE = os.environ.get("FORCE_SEND") == "true"
 UA = {"User-Agent": "Mozilla/5.0"}
-TOP_N = 10
-HISTORY_DAYS = 4  # 另外往前抓 4 個交易日,合計 5 日算連買連賣
+TOP_N = 20
+HISTORY_DAYS = 4  # 另外往前抓 4 個交易日,合計 5 日算連續天數
 RED, GREEN = "#d62728", "#2e8b57"  # 台股慣例:紅=買超/上漲,綠=賣超/下跌
 
 
@@ -30,14 +31,18 @@ def tg_text(text):
     r.raise_for_status()
 
 
-def tg_photo(buf):
-    buf.seek(0)
-    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+def tg_album(bufs):
+    media, files = [], {}
+    for i, b in enumerate(bufs):
+        b.seek(0)
+        files[f"p{i}"] = (f"chips{i}.png", b, "image/png")
+        media.append({"type": "photo", "media": f"attach://p{i}"})
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMediaGroup"
     r = requests.post(
         url,
-        data={"chat_id": CHAT_ID},
-        files={"photo": ("chips.png", buf, "image/png")},
-        timeout=60,
+        data={"chat_id": CHAT_ID, "media": json.dumps(media)},
+        files=files,
+        timeout=120,
     )
     r.raise_for_status()
 
@@ -50,8 +55,12 @@ def safe(fn, label):
         return None
 
 
+def strip_html(s):
+    return re.sub(r"<[^>]*>", "", str(s)).strip()
+
+
 def num(s):
-    return float(re.sub(r"<[^>]*>", "", str(s)).replace(",", "").strip())
+    return float(strip_html(s).replace(",", ""))
 
 
 def fetch_t86(ymd):
@@ -133,24 +142,55 @@ def get_history(day, n):
     return hist
 
 
-def get_prices():
-    r = requests.get(
-        "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-        headers=UA,
-        timeout=30,
-    )
-    r.raise_for_status()
-    out = {}
-    for d in r.json():
+def get_prices(ymd):
+    """用指定日期的每日收盤行情,算出當日漲跌幅(%)。"""
+    j = None
+    for base in (
+        "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
+        "https://www.twse.com.tw/exchangeReport/MI_INDEX",
+    ):
         try:
-            close = float(str(d["ClosingPrice"]).replace(",", ""))
-            chg = float(str(d["Change"]).replace(",", "").replace("+", ""))
-            prev = close - chg
-            if prev > 0:
-                out[d["Code"]] = chg / prev * 100
-        except (KeyError, ValueError):
-            continue
-    return out
+            r = requests.get(
+                base,
+                params={"response": "json", "date": ymd, "type": "ALLBUT0999"},
+                headers=UA,
+                timeout=60,
+            )
+            r.raise_for_status()
+            j = r.json()
+            break
+        except Exception as e:
+            print(f"[MI_INDEX {ymd}] {base} 失敗: {e}")
+    if not j or j.get("stat") != "OK":
+        raise RuntimeError(f"MI_INDEX stat={j.get('stat') if j else None}")
+
+    candidates = [(t.get("fields", []), t.get("data", [])) for t in j.get("tables", [])]
+    if j.get("fields9"):  # 舊版格式
+        candidates.append((j["fields9"], j.get("data9", [])))
+
+    for fields, rows in candidates:
+        if "證券代號" in fields and "收盤價" in fields and "漲跌價差" in fields:
+            i_code = fields.index("證券代號")
+            i_close = fields.index("收盤價")
+            i_chg = fields.index("漲跌價差")
+            i_sign = next(i for i, f in enumerate(fields) if f.startswith("漲跌("))
+            out = {}
+            for r in rows:
+                code = str(r[i_code]).strip()
+                try:
+                    close = num(r[i_close])
+                    chg = num(r[i_chg])
+                except ValueError:
+                    continue
+                s = strip_html(r[i_sign])
+                sign = -1 if "-" in s else (1 if "+" in s else 0)
+                change = sign * chg
+                prev = close - change
+                if prev > 0:
+                    out[code] = change / prev * 100
+            if out:
+                return out
+    raise RuntimeError("找不到個股收盤行情表")
 
 
 def streak(code, key, sign, series):
@@ -170,8 +210,7 @@ def build_rows(cur, key, sign, series, prices):
         s = streak(code, key, sign, series)
         streak_txt = "-"
         if s >= 2:
-            plus = "+" if s == len(series) else ""
-            streak_txt = f"連{'買' if sign > 0 else '賣'}{s}{plus}天"
+            streak_txt = f"{s}天" + ("+" if s == len(series) else "")
         pct = prices.get(code)
         pct_txt = "-"
         if pct is not None:
@@ -184,39 +223,36 @@ def build_rows(cur, key, sign, series, prices):
     return out
 
 
-def table_image(title, panels):
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.6))
-    fig.suptitle(title, fontsize=15, fontweight="bold")
-    for ax, (ptitle, rows, color) in zip(axes, panels):
-        ax.axis("off")
-        ax.set_title(ptitle, fontsize=13, color=color, fontweight="bold")
-        tbl = ax.table(
-            cellText=rows,
-            colLabels=["#", "股票", "張數", "連續", "漲跌幅"],
-            loc="upper center",
-            cellLoc="center",
-            colWidths=[0.07, 0.31, 0.17, 0.20, 0.25],
-        )
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(10.5)
-        tbl.scale(1, 1.65)
-        for (r, c), cell in tbl.get_celld().items():
-            if r == 0:
-                cell.set_facecolor(color)
-                cell.get_text().set_color("white")
-                cell.get_text().set_fontweight("bold")
-                continue
-            txt = cell.get_text().get_text()
-            if c == 2:
-                cell.get_text().set_color(color)
-                cell.get_text().set_fontweight("bold")
-            elif c == 4 and len(txt) > 1:
-                cell.get_text().set_color(RED if txt.startswith("+") else GREEN)
-            if r % 2 == 0:
-                cell.set_facecolor("#f5f5f5")
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+def table_image(title, rows, color, streak_label):
+    fig, ax = plt.subplots(figsize=(7, 10))
+    ax.axis("off")
+    ax.set_title(title, fontsize=15, color=color, fontweight="bold", pad=14)
+    tbl = ax.table(
+        cellText=rows,
+        colLabels=["#", "股票", "買賣超(張)", streak_label, "當日漲跌"],
+        loc="upper center",
+        cellLoc="center",
+        colWidths=[0.08, 0.32, 0.22, 0.17, 0.21],
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(11)
+    tbl.scale(1, 1.55)
+    for (r, c), cell in tbl.get_celld().items():
+        if r == 0:
+            cell.set_facecolor(color)
+            cell.get_text().set_color("white")
+            cell.get_text().set_fontweight("bold")
+            continue
+        txt = cell.get_text().get_text()
+        if c == 2:
+            cell.get_text().set_color(color)
+            cell.get_text().set_fontweight("bold")
+        elif c == 4 and len(txt) > 1:
+            cell.get_text().set_color(RED if txt.startswith("+") else GREEN)
+        if r % 2 == 0:
+            cell.set_facecolor("#f5f5f5")
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=110)
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", pad_inches=0.25)
     plt.close(fig)
     return buf
 
@@ -224,7 +260,7 @@ def table_image(title, panels):
 def fmt_list(title, rows):
     lines = [title]
     for r in rows:
-        extra = "" if r[3] == "-" else f" {r[3]}"
+        extra = "" if r[3] == "-" else f" 連續{r[3]}"
         extra += "" if r[4] == "-" else f" {r[4]}"
         lines.append(f"{r[0]}. {r[1]}  {r[2]}{extra}")
     return "\n".join(lines)
@@ -237,32 +273,38 @@ def main():
         print("沒有個股籌碼資料(休市或尚未公布),不發送。")
         return
     series = [cur] + get_history(day, HISTORY_DAYS)
-    prices = (safe(get_prices, "股價") or {}) if day == today else {}
 
-    sets = [
-        (f"投信買賣超 {day}(單位:張)", [
-            ("投信買超 Top10", build_rows(cur, "it", +1, series, prices), RED),
-            ("投信賣超 Top10", build_rows(cur, "it", -1, series, prices), GREEN),
-        ]),
-        (f"外資買賣超 {day}(單位:張)", [
-            ("外資買超 Top10", build_rows(cur, "fi", +1, series, prices), RED),
-            ("外資賣超 Top10", build_rows(cur, "fi", -1, series, prices), GREEN),
-        ]),
+    time.sleep(2)
+    prices = safe(lambda: get_prices(day.strftime("%Y%m%d")), "當日漲跌幅") or {}
+
+    specs = [
+        (f"投信買超 Top{TOP_N}  {day}", "it", +1, RED, "連續買超"),
+        (f"投信賣超 Top{TOP_N}  {day}", "it", -1, GREEN, "連續賣超"),
+        (f"外資買超 Top{TOP_N}  {day}", "fi", +1, RED, "連續買超"),
+        (f"外資賣超 Top{TOP_N}  {day}", "fi", -1, GREEN, "連續賣超"),
+    ]
+    tables = [
+        (title, build_rows(cur, key, sign, series, prices), color, label)
+        for title, key, sign, color, label in specs
     ]
 
-    images = [safe(lambda: table_image(t, p), "表格圖") for t, p in sets]
+    images = [safe(lambda: table_image(*t), "表格圖") for t in tables]
     if all(images):
-        for img in images:
-            tg_photo(img)
-    else:  # 圖片失敗時退回文字版
-        parts = [f"📈 個股籌碼 {day}(單位:張)", ""]
-        for _, panels in sets:
-            for ptitle, rows, _c in panels:
-                parts.append(fmt_list(f"【{ptitle}】", rows))
+        tg_album(images)
+    else:  # 圖片失敗時退回文字版(分兩則,避免超過長度限制)
+        for pair in (tables[:2], tables[2:]):
+            parts = [f"📈 個股籌碼 {day}(單位:張)", ""]
+            for title, rows, _c, _l in pair:
+                parts.append(fmt_list(f"【{title}】", rows))
                 parts.append("")
-        tg_text("\n".join(parts))
+            tg_text("\n".join(parts))
 
-    tg_text("※ 外資指外陸資(不含外資自營商);連買/連賣以近 5 個交易日計。\n※ 籌碼資料僅供參考,非投資建議。")
+    tg_text(
+        "※ 外資指外陸資(不含外資自營商)。\n"
+        "※ 連續天數以近 5 個交易日計,「5天+」代表至少連續 5 天。\n"
+        "※ 當日漲跌為當天收盤價相對前一交易日。\n"
+        "※ 籌碼資料僅供參考,非投資建議。"
+    )
     print("已發送")
 
 
