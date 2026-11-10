@@ -2,6 +2,7 @@ import os
 import re
 import io
 import sys
+import time
 import requests
 import pandas as pd
 import yfinance as yf
@@ -504,10 +505,21 @@ def build_report(df, inst, sectors, breadth):
 
 
 def main():
+    now = datetime.now(TZ)
+    today = now.date()
     df = add_indicators(get_index())
-    today = datetime.now(TZ).date()
+    # Yahoo 的加權指數有時收盤後很久才更新,先重試,不要直接放棄
+    tries = 0
+    while df.index[-1].date() != today and not FORCE and now.weekday() < 5 and tries < 4:
+        tries += 1
+        print(f"Yahoo 最新資料仍是 {df.index[-1].date()},10 分鐘後重試({tries}/4)")
+        time.sleep(600)
+        df = add_indicators(get_index())
     if df.index[-1].date() != today and not FORCE:
-        print(f"今日({today})無新資料,可能休市,不發報告。")
+        msg = f"今日({today})Yahoo 加權指數資料未更新(最新 {df.index[-1].date()}),不發報告。"
+        print(msg)
+        if now.weekday() < 5:  # 平日才提醒,休市日請忽略
+            tg_text("⚠️ 盤後報告:" + msg + "\n若今天是休市日請忽略。")
         return
     ymd = df.index[-1].strftime("%Y%m%d")
     inst = safe(lambda: get_institutional(ymd), "三大法人")
@@ -516,7 +528,13 @@ def main():
     tg_text(build_report(df, inst, sectors, breadth))
     chart = safe(lambda: make_chart(df), "圖表")
     if chart:
-        tg_photo(chart)
+        try:
+            tg_photo(chart)
+        except Exception as e:
+            print("[圖表傳送] 失敗:", e)
+            tg_text(f"⚠️ 走勢圖傳送失敗:{e}")
+    else:
+        tg_text("⚠️ 今日走勢圖產生失敗,請查看 GitHub Actions 日誌。")
     print("已發送")
 
 

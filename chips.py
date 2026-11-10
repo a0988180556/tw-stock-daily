@@ -271,6 +271,8 @@ def main():
     day, cur = get_latest(today)
     if not cur:
         print("沒有個股籌碼資料(休市或尚未公布),不發送。")
+        if datetime.now(TZ).weekday() < 5:
+            tg_text("⚠️ 個股籌碼:證交所今日資料尚未公布或抓取失敗,今日未產生表格。若今天是休市日請忽略。")
         return
     series = [cur] + get_history(day, HISTORY_DAYS)
 

@@ -399,18 +399,27 @@ def main():
     now = datetime.now(TZ)
     since, days = news_window(now)
     wd = "一二三四五六日"[now.weekday()]
+    late = ""
+    if now.hour >= 9:
+        late = f"\n⚠️ GitHub 排程延遲,實際執行時間 {now:%H:%M}(原訂 07:07)"
     tg_text(
         f"🌅 盤前新聞 {now:%Y-%m-%d}(週{wd})\n"
-        f"新聞範圍:{since:%m/%d %H:%M} ~ {now:%m/%d %H:%M}"
+        f"新聞範圍:{since:%m/%d %H:%M} ~ {now:%m/%d %H:%M}{late}"
     )
 
-    pool = []
+    pool, taken = [], []
     for group, qs in QUERIES.items():
         items = collect(qs, since, days, exclude=EXCLUDE_TOPICS.get(group, ()))
         pool += items
+        # 已經放在前一組(台股)的新聞,不再出現在美股
+        items = [
+            it for it in items
+            if all(it.get("link") != t.get("link") and not too_similar(it["title"], t["title"]) for t in taken)
+        ]
         picks = safe(lambda: pick_with_llm(group, items), f"LLM {group}") or []
         picks = diversify(picks, items, 5)
-        flag = "🇹🇼" if group == "台股" else "🇺🇸"
+        taken += [it for it, _ in picks]
+        flag = "📈" if group == "台股" else "🇺🇸"
         tg_text(fmt_group(f"{flag} {group}重要新聞", picks))
 
     ranked = safe(lambda: build_watchlist(pool), "關注清單") or []
