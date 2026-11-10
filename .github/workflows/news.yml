@@ -1,8 +1,7 @@
 name: tw-us-news
 
 on:
-  schedule:
-    - cron: "7 23 * * 0-4"   # 台灣週一~五 07:07,避開整點/半點的排程塞車
+  # 由 cron-job.org 於台灣週一~五 07:07 準時觸發(GitHub 內建排程常延遲,已移除)
   workflow_dispatch:
 
 jobs:
