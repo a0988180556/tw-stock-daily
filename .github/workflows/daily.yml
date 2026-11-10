@@ -1,14 +1,13 @@
 name: tw-stock-daily
 
 on:
-  schedule:
-    - cron: "41 8 * * 1-5"   # 台灣週一~五 16:41,避開整點/半點的排程塞車
+  # 由 cron-job.org 於台灣週一~五 16:41 準時觸發(GitHub 內建排程常延遲,已移除)
   workflow_dispatch:
     inputs:
       force:
         description: "force send"
         type: boolean
-        default: true
+        default: false
 
 jobs:
   run:
