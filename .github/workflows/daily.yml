@@ -2,7 +2,7 @@ name: tw-stock-daily
 
 on:
   schedule:
-    - cron: "30 8 * * 1-5"
+    - cron: "41 8 * * 1-5"   # 台灣週一~五 16:41,避開整點/半點的排程塞車
   workflow_dispatch:
     inputs:
       force:
@@ -13,6 +13,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
